@@ -158,6 +158,10 @@ HARDWARE_DESC?=regular
 # some oddball old (typically one-colored) display, such as Hub12.
 #DEFINES+=-DONLY_SINGLE_SUB_PANEL
 
+# In case we're using a display with ICN2038S - this really belongs in the panel
+# configuration, but I am testing it here
+#DEFINES+=-DICN2038S
+
 # If someone gives additional values on the make commandline e.g.
 # make USER_DEFINES="-DSHOW_REFRESH_RATE"
 DEFINES+=$(USER_DEFINES)
