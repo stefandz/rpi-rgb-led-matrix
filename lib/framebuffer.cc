@@ -795,6 +795,9 @@ void Framebuffer::DumpToMatrix(GPIO *io, int pwm_low_bit) {
         const gpio_bits_t &out = *row_data++;
         io->WriteMaskedBits(out, color_clk_mask);  // col + reset clock
         io->SetBits(h.clock);               // Rising edge: clock color in.
+	#ifdef ICN2038S      
+	  if (col == columns_-4) io->SetBits(h.strobe); // ICN2038S : Bird Techstep
+	#endif
       }
       io->ClearBits(color_clk_mask);    // clock back to normal.
 
