@@ -21,6 +21,8 @@
 #define RPI_RGBMATRIX_H
 
 #include <stdint.h>
+#include <stddef.h>
+
 #include <string>
 #include <vector>
 
@@ -144,6 +146,14 @@ public:
     // to this matrix. A semicolon-separated list of pixel-mappers with optional
     // parameter.
     const char *pixel_mapper_config;   // Flag: --led-pixel-mapper
+
+    // Panel type. Typically an empty string or NULL, but some panels need
+    // a particular initialization sequence, so this is used for that.
+    const char *panel_type;  // Flag: --led-panel-type
+
+    // Limit refresh rate of LED panel. This will help on a loaded system
+    // to keep a constant refresh rate. <= 0 for no limit.
+    int limit_refresh_rate_hz;   // Flag: --led-limit-refresh
   };
 
   // Create an RGBMatrix.
@@ -201,6 +211,12 @@ public:
   // Returns 'false' if it couldn't start because GPIO was not set yet.
   bool StartRefresh();
 
+  // Apply a pixel mapper. This is used to re-map pixels according to some
+  // scheme implemented by the PixelMapper. Does not take ownership of the
+  // mapper. Mapper can be NULL, in which case nothing happens.
+  // Returns a boolean indicating if this was successful.
+  bool ApplyPixelMapper(const PixelMapper *mapper);
+
   // Set PWM bits used for output. Default is 11, but if you only deal with
   // limited comic-colors, 1 might be sufficient. Lower require less CPU and
   // increases refresh-rate.
@@ -220,6 +236,34 @@ public:
   // This will only affect newly set pixels.
   void SetBrightness(uint8_t brightness);
   uint8_t brightness();
+
+  //-- GPIO interaction
+
+  // Return pointer to GPIO object for your own interaction with free
+  // pins. But don't mess with bits already in use by the matrix :)
+  GPIO *gpio() { return io_; }
+
+  // This function will return whenever the GPIO input pins
+  // change (pins that are not already in use for output, that is) or the
+  // timeout is reached. You need to have reserved the inputs with
+  // gpio()->RequestInputs(...) first (e.g.
+  //   gpio()->RequestInputs((1<<25)|(1<<24));
+  //
+  // A positive timeout waits the given amount of milliseconds for a change
+  // (e.g. a button-press) to occur; if there is no change, it will just
+  // return the last value.
+  // If you just want to know how the pins are right now, call with zero
+  // timeout.
+  // A negative number waits forever and will only return if there is a change.
+  //
+  // Note, while you can poll the gpio()->Read() function directly, it is
+  // not recommended as this might occur during the display update which might
+  // result in flicker.
+  // This function only samples between display refreshes and is more
+  // convenient as it allows to wait for a change.
+  //
+  // Returns the bitmap of all GPIO input pins.
+  uint32_t AwaitInputChange(int timeout_ms);
 
   //-- Double- and Multibuffering.
 
@@ -251,12 +295,6 @@ public:
   // 28Hz animation, nicely locked to the frame-rate).
   FrameCanvas *SwapOnVSync(FrameCanvas *other, unsigned framerate_fraction = 1);
 
-  // Apply a pixel mapper. This is used to re-map pixels according to some
-  // scheme implemented by the PixelMapper. Does not take ownership of the
-  // mapper. Mapper can be NULL, in which case nothing happens.
-  // Returns a boolean indicating if this was successful.
-  bool ApplyPixelMapper(const PixelMapper *mapper);
-
   // -- Canvas interface. These write to the active FrameCanvas
   // (see documentation in canvas.h)
   virtual int width() const;
@@ -267,7 +305,7 @@ public:
   virtual void Fill(uint8_t red, uint8_t green, uint8_t blue);
 
 
-#ifndef REMOVE_DEPRECATED_TRANSFORMERS
+#ifdef INCLUDE_DEPRECATED_TRANSFORMERS
   //--- deprecated section: transformers. Use PixelMapper instead.
   void ApplyStaticTransformer(const CanvasTransformer &transformer) __attribute__((deprecated)) {
     ApplyStaticTransformerDeprecated(transformer);
@@ -291,9 +329,9 @@ private:
   void ApplyNamedPixelMappers(const char *pixel_mapper_config,
                               int chain, int parallel);
 
-#ifndef REMOVE_DEPRECATED_TRANSFORMERS
+#ifdef INCLUDE_DEPRECATED_TRANSFORMERS
   void ApplyStaticTransformerDeprecated(const CanvasTransformer &transformer);
-#endif  // REMOVE_DEPRECATED_TRANSFORMERS
+#endif  // INCLUDE_DEPRECATED_TRANSFORMERS
 
   Options params_;
   bool do_luminance_correct_;
@@ -302,7 +340,7 @@ private:
 
   GPIO *io_;
   Mutex active_frame_sync_;
-#ifndef REMOVE_DEPRECATED_TRANSFORMERS
+#ifdef INCLUDE_DEPRECATED_TRANSFORMERS
   CanvasTransformer *transformer_;  // deprecated. To be removed.
 #endif
   UpdateThread *updater_;

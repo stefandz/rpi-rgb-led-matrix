@@ -47,22 +47,21 @@
 #endif
 
 namespace rgb_matrix {
-
-// Get rolling over microsecond counter. Right now for experimental
-// purposes declared here (defined in gpio.cc).
-uint32_t GetMicrosecondCounter();
-
 using namespace internal;
 
 // Pump pixels to screen. Needs to be high priority real-time because jitter
 class RGBMatrix::UpdateThread : public Thread {
 public:
   UpdateThread(GPIO *io, FrameCanvas *initial_frame,
-               int pwm_dither_bits, bool show_refresh)
-    : io_(io), show_refresh_(show_refresh), running_(true),
+               int pwm_dither_bits, bool show_refresh,
+               int limit_refresh_hz)
+    : io_(io), show_refresh_(show_refresh),
+      target_frame_usec_(limit_refresh_hz < 1 ? 0 : 1e6/limit_refresh_hz),
+      running_(true),
       current_frame_(initial_frame), next_frame_(NULL),
       requested_frame_multiple_(1) {
     pthread_cond_init(&frame_done_, NULL);
+    pthread_cond_init(&input_change_, NULL);
     switch (pwm_dither_bits) {
     case 0:
       start_bit_[0] = 0; start_bit_[1] = 0;
@@ -88,6 +87,7 @@ public:
     unsigned frame_count = 0;
     unsigned low_bit_sequence = 0;
     uint32_t largest_time = 0;
+    uint32_t last_gpio_bits = 0;
 
     // Let's start measure max time only after a we were running for a few
     // seconds to not pick up start-up glitches.
@@ -101,6 +101,7 @@ public:
       current_frame_->framebuffer()
         ->DumpToMatrix(io_, start_bit_[low_bit_sequence % 4]);
 
+      // SwapOnVSync() exchange.
       {
         MutexLock l(&frame_sync_);
         // Do fast equality test first (likely due to frame_count reset).
@@ -117,22 +118,35 @@ public:
         }
       }
 
+      // Read input bits.
+      const uint32_t inputs = io_->Read();
+      if (inputs != last_gpio_bits) {
+        last_gpio_bits = inputs;
+        MutexLock l(&input_sync_);
+        gpio_inputs_ = inputs;
+        pthread_cond_signal(&input_change_);
+      }
+
       ++frame_count;
       ++low_bit_sequence;
 
-#ifdef FIXED_FRAME_MICROSECONDS
-      while ((GetMicrosecondCounter() - start_time_us) < (uint32_t)FIXED_FRAME_MICROSECONDS) {
-        // busy wait.
+      if (target_frame_usec_) {
+        while ((GetMicrosecondCounter() - start_time_us) < target_frame_usec_) {
+          // busy wait. We have our dedicated core, so ok to burn cycles.
+        }
       }
-#endif
+
       const uint32_t end_time_us = GetMicrosecondCounter();
       if (show_refresh_) {
         uint32_t usec = end_time_us - start_time_us;
         printf("\b\b\b\b\b\b\b\b%6.1fHz", 1e6 / usec);
         if (usec > largest_time && max_measure_enabled) {
           largest_time = usec;
-          printf(" max: %uusec\b\b\b\b\b\b\b\b\b\b\b\b\b\b", largest_time);
+          const float lowest_hz = 1e6 / largest_time;
+          printf(" (lowest: %.1fHz)"
+                 "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b", lowest_hz);
         } else {
+          // Don't measure at startup, as times will be janky.
           max_measure_enabled = (end_time_us - initial_holdoff_start) > kHoldffTimeUs;
         }
       }
@@ -148,6 +162,12 @@ public:
     return previous;
   }
 
+  uint32_t AwaitInputChange(int timeout_ms) {
+    MutexLock l(&input_sync_);
+    input_sync_.WaitOn(&input_change_, timeout_ms);
+    return gpio_inputs_;
+  }
+
 private:
   inline bool running() {
     MutexLock l(&running_mutex_);
@@ -156,9 +176,15 @@ private:
 
   GPIO *const io_;
   const bool show_refresh_;
+  const uint32_t target_frame_usec_;
   uint32_t start_bit_[4];
+
   Mutex running_mutex_;
   bool running_;
+
+  Mutex input_sync_;
+  pthread_cond_t input_change_;
+  uint32_t gpio_inputs_;
 
   Mutex frame_sync_;
   pthread_cond_t frame_done_;
@@ -216,14 +242,55 @@ RGBMatrix::Options::Options() :
     inverse_colors(false),
 #endif
   led_rgb_sequence("RGB"),
-  pixel_mapper_config(NULL)
+  pixel_mapper_config(NULL),
+  panel_type(NULL),
+#ifdef FIXED_FRAME_MICROSECONDS
+  limit_refresh_rate_hz(1e6 / FIXED_FRAME_MICROSECONDS)
+#else
+  limit_refresh_rate_hz(0)
+#endif
 {
   // Nothing to see here.
 }
 
+#define DEBUG_MATRIX_OPTIONS 0
+
+#if DEBUG_MATRIX_OPTIONS
+static void PrintOptions(const RGBMatrix::Options &o) {
+#define P_INT(val) fprintf(stderr, "%s : %d\n", #val, o.val)
+#define P_STR(val) fprintf(stderr, "%s : %s\n", #val, o.val)
+#define P_BOOL(val) fprintf(stderr, "%s : %s\n", #val, o.val ? "true":"false")
+  P_STR(hardware_mapping);
+  P_INT(rows);
+  P_INT(cols);
+  P_INT(chain_length);
+  P_INT(parallel);
+  P_INT(pwm_bits);
+  P_INT(pwm_lsb_nanoseconds);
+  P_INT(pwm_dither_bits);
+  P_INT(brightness);
+  P_INT(scan_mode);
+  P_INT(row_address_type);
+  P_INT(multiplexing);
+  P_BOOL(disable_hardware_pulsing);
+  P_BOOL(show_refresh_rate);
+  P_BOOL(inverse_colors);
+  P_STR(led_rgb_sequence);
+  P_STR(pixel_mapper_config);
+  P_STR(panel_type);
+  P_INT(limit_refresh_rate_hz);
+#undef P_INT
+#undef P_STR
+#undef P_BOOL
+}
+#endif  // DEBUG_MATRIX_OPTIONS
+
 RGBMatrix::RGBMatrix(GPIO *io, const Options &options)
   : params_(options), io_(NULL), updater_(NULL), shared_pixel_mapper_(NULL) {
   assert(params_.Validate(NULL));
+#if DEBUG_MATRIX_OPTIONS
+  PrintOptions(params_);
+#endif
   const MultiplexMapper *multiplex_mapper = NULL;
   if (params_.multiplexing > 0) {
     const MuxMapperList &multiplexers = GetRegisteredMultiplexMappers();
@@ -240,6 +307,7 @@ RGBMatrix::RGBMatrix(GPIO *io, const Options &options)
   }
 
   Framebuffer::InitHardwareMapping(params_.hardware_mapping);
+
   active_ = CreateFrameCanvas();
   Clear();
   SetGPIO(io, true);
@@ -259,6 +327,10 @@ RGBMatrix::RGBMatrix(GPIO *io, int rows, int chained_displays,
   params_.chain_length = chained_displays;
   params_.parallel = parallel_displays;
   assert(params_.Validate(NULL));
+#if DEBUG_MATRIX_OPTIONS
+  PrintOptions(params_);
+#endif
+
   Framebuffer::InitHardwareMapping(params_.hardware_mapping);
   active_ = CreateFrameCanvas();
   Clear();
@@ -266,13 +338,15 @@ RGBMatrix::RGBMatrix(GPIO *io, int rows, int chained_displays,
 }
 
 RGBMatrix::~RGBMatrix() {
-  updater_->Stop();
-  updater_->WaitStopped();
+  if (updater_) {
+    updater_->Stop();
+    updater_->WaitStopped();
+  }
   delete updater_;
 
   // Make sure LEDs are off.
   active_->Clear();
-  active_->framebuffer()->DumpToMatrix(io_, 0);
+  if (io_) active_->framebuffer()->DumpToMatrix(io_, 0);
 
   for (size_t i = 0; i < created_frames_.size(); ++i) {
     delete created_frames_[i];
@@ -312,6 +386,8 @@ void RGBMatrix::SetGPIO(GPIO *io, bool start_thread) {
                           !params_.disable_hardware_pulsing,
                           params_.pwm_lsb_nanoseconds, params_.pwm_dither_bits,
                           params_.row_address_type);
+    Framebuffer::InitializePanels(io_, params_.panel_type,
+                                  params_.cols * params_.chain_length);
   }
   if (start_thread) {
     StartRefresh();
@@ -321,7 +397,8 @@ void RGBMatrix::SetGPIO(GPIO *io, bool start_thread) {
 bool RGBMatrix::StartRefresh() {
   if (updater_ == NULL && io_ != NULL) {
     updater_ = new UpdateThread(io_, active_, params_.pwm_dither_bits,
-                                params_.show_refresh_rate);
+                                params_.show_refresh_rate,
+                                params_.limit_refresh_rate_hz);
     // If we have multiple processors, the kernel
     // jumps around between these, creating some global flicker.
     // So let's tie it to the last CPU available.
@@ -362,6 +439,11 @@ FrameCanvas *RGBMatrix::SwapOnVSync(FrameCanvas *other,
   FrameCanvas *const previous = updater_->SwapOnVSync(other, frame_fraction);
   if (other) active_ = other;
   return previous;
+}
+
+uint32_t RGBMatrix::AwaitInputChange(int timeout_ms) {
+  if (!updater_) return 0;
+  return updater_->AwaitInputChange(timeout_ms);
 }
 
 bool RGBMatrix::SetPWMBits(uint8_t value) {
@@ -423,8 +505,8 @@ bool RGBMatrix::ApplyPixelMapper(const PixelMapper *mapper) {
   if (!mapper->GetSizeMapping(old_width, old_height, &new_width, &new_height)) {
     return false;
   }
-  PixelDesignatorMap *new_mapper = new PixelDesignatorMap(new_width,
-                                                          new_height);
+  PixelDesignatorMap *new_mapper = new PixelDesignatorMap(
+    new_width, new_height, shared_pixel_mapper_->GetFillColorBits());
   for (int y = 0; y < new_height; ++y) {
     for (int x = 0; x < new_width; ++x) {
       int orig_x = -1, orig_y = -1;
@@ -446,7 +528,7 @@ bool RGBMatrix::ApplyPixelMapper(const PixelMapper *mapper) {
   return true;
 }
 
-#ifndef REMOVE_DEPRECATED_TRANSFORMERS
+#ifdef INCLUDE_DEPRECATED_TRANSFORMERS
 namespace {
 // A pixel mapper
 class PixelMapExtractionCanvas : public Canvas {
@@ -505,7 +587,8 @@ void RGBMatrix::ApplyStaticTransformerDeprecated(
 
   const int new_width = mapped_canvas->width();
   const int new_height = mapped_canvas->height();
-  PixelDesignatorMap *new_mapper = new PixelDesignatorMap(new_width, new_height);
+  PixelDesignatorMap *new_mapper = new PixelDesignatorMap(
+    new_width, new_height, shared_pixel_mapper_->GetFillColorBits());
   extractor_canvas.SetNewMapper(new_mapper);
   // Learn about the pixel mapping by going through all transformed pixels and
   // build new PixelDesignator map.
@@ -518,7 +601,7 @@ void RGBMatrix::ApplyStaticTransformerDeprecated(
   delete shared_pixel_mapper_;
   shared_pixel_mapper_ = new_mapper;
 }
-#endif  // REMOVE_DEPRECATED_TRANSFORMERS
+#endif  // INCLUDE_DEPRECATED_TRANSFORMERS
 
 // FrameCanvas implementation of Canvas
 FrameCanvas::~FrameCanvas() { delete frame_; }
